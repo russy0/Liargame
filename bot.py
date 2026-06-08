@@ -14,7 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from game import LiarGame, Phase, Player, VoteResult, Winner
+from game import LiarGame, Phase, Player, VoteResult, Winner, normalize_answer
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,6 +49,9 @@ class BotConfig:
     max_player_count: int = 12
     recruitment_seconds: int = 60
     discussion_seconds: int = 180
+    speech_seconds: int = 25
+    discussion_extension_seconds: int = 60
+    max_discussion_extensions: int = 2
     vote_seconds: int = 45
     guess_seconds: int = 30
     chat_slowmode_seconds: int = 3
@@ -100,6 +103,9 @@ def sanitize_config(value: BotConfig) -> None:
     value.default_liar_count = min(value.default_liar_count, value.max_player_count - 1)
     value.recruitment_seconds = max(10, int(value.recruitment_seconds))
     value.discussion_seconds = max(10, int(value.discussion_seconds))
+    value.speech_seconds = max(5, int(value.speech_seconds))
+    value.discussion_extension_seconds = max(10, int(value.discussion_extension_seconds))
+    value.max_discussion_extensions = max(0, int(value.max_discussion_extensions))
     value.vote_seconds = max(10, int(value.vote_seconds))
     value.guess_seconds = max(10, int(value.guess_seconds))
     value.chat_slowmode_seconds = max(0, int(value.chat_slowmode_seconds))
@@ -369,6 +375,45 @@ def effective_max_player_count() -> int:
     return min(MAX_GAME_PLAYERS, max(config.min_player_count, config.max_player_count))
 
 
+def matching_categories(search: str | None = None) -> list[str]:
+    categories = sorted(config.word_bank.keys())
+    if not search:
+        return categories
+    needle = normalize_answer(search)
+    if not needle:
+        return categories
+    return [
+        category
+        for category in categories
+        if needle in normalize_answer(category)
+    ]
+
+
+def resolve_category_name(category: str) -> str | None:
+    clean_category = category.strip()
+    if not clean_category:
+        return None
+    normalized_category = normalize_answer(clean_category)
+    for candidate in config.word_bank:
+        if normalize_answer(candidate) == normalized_category:
+            return candidate
+    matches = matching_categories(clean_category)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+async def category_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    matches = matching_categories(current)
+    return [
+        app_commands.Choice(name=f"{category} ({len(config.word_bank[category])}개)"[:100], value=category)
+        for category in matches[:25]
+    ]
+
+
 def current_settings_text(prefix: str = "라이어게임 설정") -> str:
     categories = ", ".join(sorted(config.word_bank.keys()))
     return (
@@ -379,6 +424,8 @@ def current_settings_text(prefix: str = "라이어게임 설정") -> str:
         f"인원: `{config.min_player_count}`-`{effective_max_player_count()}`명\n"
         f"모집/토론/투표/추측: `{config.recruitment_seconds}`/`{config.discussion_seconds}`/"
         f"`{config.vote_seconds}`/`{config.guess_seconds}`초\n"
+        f"발언/연장: `{config.speech_seconds}`/`{config.discussion_extension_seconds}`초, "
+        f"최대 `{config.max_discussion_extensions}`회\n"
         f"토론 슬로우모드: `{config.chat_slowmode_seconds}`초\n"
         f"단어 카테고리: {categories}"
     )
@@ -439,12 +486,18 @@ def choose_word(category: str | None, word: str | None) -> tuple[str, str]:
     clean_word = word.strip() if word else ""
     clean_category = category.strip() if category else ""
     if clean_word:
-        return clean_word, clean_category or "직접 입력"
+        resolved_category = resolve_category_name(clean_category) if clean_category else None
+        return clean_word, resolved_category or clean_category or "직접 입력"
     if clean_category:
-        words = config.word_bank.get(clean_category)
+        resolved_category = resolve_category_name(clean_category)
+        if not resolved_category:
+            matches = matching_categories(clean_category)
+            hint = f" 비슷한 주제: {', '.join(matches[:5])}" if matches else " `/라이어주제`로 전체 목록을 확인하세요."
+            raise ValueError(f"`{clean_category}` 카테고리를 찾을 수 없습니다.{hint}")
+        words = config.word_bank[resolved_category]
         if not words:
-            raise ValueError(f"`{clean_category}` 카테고리를 찾을 수 없습니다.")
-        return random.choice(words), clean_category
+            raise ValueError(f"`{resolved_category}` 카테고리에 단어가 없습니다.")
+        return random.choice(words), resolved_category
     category_name = random.choice(list(config.word_bank.keys()))
     return random.choice(config.word_bank[category_name]), category_name
 
@@ -751,6 +804,112 @@ class GuessView(discord.ui.View):
         await interaction.response.send_modal(GuessModal(self))
 
 
+class DiscussionControlView(discord.ui.View):
+    def __init__(self, running: RunningGame) -> None:
+        super().__init__(timeout=config.discussion_seconds + config.discussion_extension_seconds * config.max_discussion_extensions + 30)
+        self.running = running
+        self.message: discord.Message | None = None
+        self.current_speaker_id: int | None = None
+        self.current_speaker_name = "대기 중"
+        self.skip_votes: set[int] = set()
+        self.extension_votes: set[int] = set()
+        self.extensions_used = 0
+        self.speech_done_event = asyncio.Event()
+        self.skip_event = asyncio.Event()
+        self.extension_event = asyncio.Event()
+
+    def required_votes(self) -> int:
+        return len(self.running.game.players) // 2 + 1
+
+    def participant(self, user_id: int) -> Player | None:
+        return self.running.game.get_player(user_id)
+
+    def status_text(self) -> str:
+        extension_status = (
+            f"{len(self.extension_votes)}/{self.required_votes()}표 "
+            f"({self.extensions_used}/{config.max_discussion_extensions}회 사용)"
+        )
+        return (
+            f"현재 발언자: **{self.current_speaker_name}**\n"
+            f"발언 완료는 현재 발언자만 누를 수 있습니다.\n\n"
+            f"토론 스킵 투표: **{len(self.skip_votes)}/{self.required_votes()}표**\n"
+            f"토론 연장 투표: **{extension_status}**"
+        )
+
+    def set_current_speaker(self, player: Player) -> None:
+        self.current_speaker_id = player.user_id
+        self.current_speaker_name = player.name
+        self.speech_done_event.clear()
+
+    async def refresh_message(self) -> None:
+        if not self.message:
+            return
+        with suppress(discord.DiscordException):
+            await self.message.edit(embed=make_embed(self.status_text(), title="토론 진행"), view=self)
+
+    async def add_vote(
+        self,
+        interaction: discord.Interaction,
+        votes: set[int],
+        event: asyncio.Event,
+        success_message: str,
+    ) -> None:
+        player = self.participant(interaction.user.id)
+        if not player:
+            await send_interaction_reply(interaction, "참가자만 누를 수 있습니다.", private=True)
+            return
+        if interaction.user.id in votes:
+            await send_interaction_reply(interaction, "이미 투표했습니다.", private=True)
+            return
+        votes.add(interaction.user.id)
+        if len(votes) >= self.required_votes():
+            event.set()
+            await send_interaction_reply(interaction, success_message, color=SUCCESS_EMBED_COLOR, private=True)
+        else:
+            await send_interaction_reply(
+                interaction,
+                f"투표 완료. 현재 {len(votes)}/{self.required_votes()}표입니다.",
+                private=True,
+            )
+        await self.refresh_message()
+
+    @discord.ui.button(label="발언 완료", style=discord.ButtonStyle.primary)
+    async def finish_speech(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if interaction.user.id != self.current_speaker_id:
+            await send_interaction_reply(interaction, "현재 발언자만 사용할 수 있습니다.", private=True)
+            return
+        self.speech_done_event.set()
+        await send_interaction_reply(interaction, "발언을 완료했습니다.", color=SUCCESS_EMBED_COLOR, private=True)
+
+    @discord.ui.button(label="토론 스킵", style=discord.ButtonStyle.danger)
+    async def skip_discussion(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        await self.add_vote(interaction, self.skip_votes, self.skip_event, "과반수로 토론을 스킵합니다.")
+
+    @discord.ui.button(label="토론 연장", style=discord.ButtonStyle.secondary)
+    async def extend_discussion(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if self.extensions_used >= config.max_discussion_extensions:
+            await send_interaction_reply(interaction, "토론 연장 횟수를 모두 사용했습니다.", private=True)
+            return
+        before = len(self.extension_votes)
+        await self.add_vote(interaction, self.extension_votes, self.extension_event, "과반수로 토론을 연장합니다.")
+        if len(self.extension_votes) >= self.required_votes() and before < self.required_votes():
+            self.extensions_used += 1
+            self.extension_votes.clear()
+            await self.refresh_message()
+
+
 class LiarBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.tree.sync()
@@ -773,6 +932,7 @@ async def on_ready() -> None:
     주제="단어장 카테고리 또는 직접 입력 제시어의 주제",
     라이어수="이번 게임 라이어 수",
 )
+@app_commands.autocomplete(주제=category_autocomplete)
 async def start_game(
     interaction: discord.Interaction,
     제시어: str | None = None,
@@ -903,6 +1063,105 @@ async def remove_recruitment_roles(guild: discord.Guild, join_view: JoinGameView
                 await member.remove_roles(role, reason="라이어게임 모집 취소")
 
 
+async def wait_for_discussion_event(view: DiscussionControlView, seconds: int) -> str:
+    events = {
+        asyncio.create_task(view.speech_done_event.wait()): "done",
+        asyncio.create_task(view.skip_event.wait()): "skip",
+        asyncio.create_task(view.extension_event.wait()): "extend",
+    }
+    done, pending = await asyncio.wait(events.keys(), timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    if not done:
+        return "timeout"
+    if view.skip_event.is_set():
+        return "skip"
+    if view.extension_event.is_set():
+        view.extension_event.clear()
+        return "extend"
+    if view.speech_done_event.is_set():
+        view.speech_done_event.clear()
+        return "done"
+    return "timeout"
+
+
+async def run_discussion_phase(channel: discord.abc.Messageable, running: RunningGame) -> None:
+    game = running.game
+    game.start_discussion()
+    await set_discussion_slowmode(channel, running)
+
+    speaking_order = game.players[:]
+    random.shuffle(speaking_order)
+    order_text = "\n".join(
+        f"{index}. {player.name}"
+        for index, player in enumerate(speaking_order, start=1)
+    )
+    await send_embed(
+        channel,
+        f"토론 시간: **{duration_text(config.discussion_seconds)}**\n"
+        f"발언 시간: 1인당 **{duration_text(config.speech_seconds)}**\n"
+        f"연장: **{duration_text(config.discussion_extension_seconds)}**, 최대 **{config.max_discussion_extensions}회**\n\n"
+        f"발언 순서\n{order_text}",
+        title="토론 시작",
+    )
+
+    control_view = DiscussionControlView(running)
+    control_message = await send_embed(channel, control_view.status_text(), title="토론 진행", view=control_view)
+    control_view.message = control_message
+
+    deadline = time.monotonic() + config.discussion_seconds
+    speaker_index = 0
+    round_number = 1
+    try:
+        while time.monotonic() < deadline and not control_view.skip_event.is_set():
+            player = speaking_order[speaker_index % len(speaking_order)]
+            if speaker_index and speaker_index % len(speaking_order) == 0:
+                round_number += 1
+                await send_embed(channel, f"발언 순서 {round_number}라운드를 시작합니다.", title="다음 라운드")
+
+            remaining = max(1, int(deadline - time.monotonic()))
+            turn_seconds = min(config.speech_seconds, remaining)
+            control_view.set_current_speaker(player)
+            await control_view.refresh_message()
+            await send_embed(
+                channel,
+                f"현재 발언자: **{player.name}**\n"
+                f"제한 시간: **{duration_text(turn_seconds)}**\n"
+                "발언을 마치면 `발언 완료` 버튼을 누르세요.",
+                title="발언 차례",
+            )
+
+            turn_deadline = time.monotonic() + turn_seconds
+            while time.monotonic() < deadline and time.monotonic() < turn_deadline:
+                remaining_turn = max(1, int(min(deadline, turn_deadline) - time.monotonic()))
+                result = await wait_for_discussion_event(control_view, remaining_turn)
+                if result == "extend":
+                    deadline += config.discussion_extension_seconds
+                    await send_embed(
+                        channel,
+                        f"토론 시간이 **{duration_text(config.discussion_extension_seconds)}** 연장되었습니다.",
+                        title="토론 연장",
+                        color=SUCCESS_EMBED_COLOR,
+                    )
+                    await control_view.refresh_message()
+                    continue
+                if result == "skip":
+                    await send_embed(channel, "과반수 요청으로 토론을 종료하고 투표로 넘어갑니다.", title="토론 스킵")
+                    return
+                break
+
+            speaker_index += 1
+    finally:
+        disable_view_items(control_view)
+        if control_message:
+            with suppress(discord.DiscordException):
+                await control_message.edit(view=control_view)
+
+    await send_embed(channel, "토론 시간이 끝났습니다. 투표로 넘어갑니다.", title="토론 종료")
+
+
 async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
     channel = guild.get_channel(running.channel_id)
     if not isinstance(channel, discord.abc.Messageable):
@@ -926,15 +1185,7 @@ async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
                 color=WARNING_EMBED_COLOR,
             )
 
-        game.start_discussion()
-        await set_discussion_slowmode(channel, running)
-        await send_embed(
-            channel,
-            f"토론 시간은 **{duration_text(config.discussion_seconds)}**입니다.\n"
-            "시민은 라이어를 찾고, 라이어는 제시어를 추리하세요.",
-            title="토론 시작",
-        )
-        await asyncio.sleep(config.discussion_seconds)
+        await run_discussion_phase(channel, running)
 
         game.start_vote()
         running.vote_complete_event.clear()
@@ -1138,6 +1389,34 @@ async def show_status(interaction: discord.Interaction) -> None:
     await send_interaction_reply(interaction, game_status_text(running), private=True)
 
 
+@bot.tree.command(name="라이어주제", description="라이어게임 단어 카테고리를 검색합니다.")
+@app_commands.describe(검색어="비워두면 전체 주제를 보여줍니다. 띄어쓰기는 무시됩니다.")
+@app_commands.autocomplete(검색어=category_autocomplete)
+async def show_categories(interaction: discord.Interaction, 검색어: str | None = None) -> None:
+    categories = matching_categories(검색어)
+    if not categories:
+        await send_interaction_reply(
+            interaction,
+            "검색 결과가 없습니다. 예: `한국음식`, `세계도시`, `화학원소`",
+            title="라이어게임 주제",
+            private=True,
+        )
+        return
+    total_words = sum(len(config.word_bank[category]) for category in categories)
+    lines = [
+        f"- **{category}**: {len(config.word_bank[category])}개"
+        for category in categories
+    ]
+    await send_interaction_reply(
+        interaction,
+        f"검색 결과: **{len(categories)}개 주제**, **{total_words}개 단어**\n"
+        "주제 입력은 띄어쓰기 없이 해도 인식됩니다.\n\n"
+        + "\n".join(lines),
+        title="라이어게임 주제",
+        private=True,
+    )
+
+
 @bot.tree.command(name="라이어설정", description="라이어게임 기본 설정을 변경합니다.")
 @app_commands.describe(
     라이어수="기본 라이어 수",
@@ -1145,6 +1424,9 @@ async def show_status(interaction: discord.Interaction) -> None:
     최대인원=f"게임 최대 인원. 최대 {MAX_GAME_PLAYERS}명",
     모집초="참가자 모집 시간",
     토론초="토론 시간",
+    발언초="한 사람당 발언 시간",
+    연장초="토론 연장 1회당 추가 시간",
+    최대연장="토론 연장 최대 횟수",
     투표초="투표 시간",
     추측초="라이어 제시어 추측 시간",
     슬로우모드초="토론 채널 슬로우모드",
@@ -1158,6 +1440,9 @@ async def configure_game(
     최대인원: int | None = None,
     모집초: int | None = None,
     토론초: int | None = None,
+    발언초: int | None = None,
+    연장초: int | None = None,
+    최대연장: int | None = None,
     투표초: int | None = None,
     추측초: int | None = None,
     슬로우모드초: int | None = None,
@@ -1176,6 +1461,12 @@ async def configure_game(
         config.recruitment_seconds = 모집초
     if 토론초 is not None:
         config.discussion_seconds = 토론초
+    if 발언초 is not None:
+        config.speech_seconds = 발언초
+    if 연장초 is not None:
+        config.discussion_extension_seconds = 연장초
+    if 최대연장 is not None:
+        config.max_discussion_extensions = 최대연장
     if 투표초 is not None:
         config.vote_seconds = 투표초
     if 추측초 is not None:
@@ -1218,6 +1509,8 @@ async def show_rules(interaction: discord.Interaction) -> None:
     await send_interaction_reply(
         interaction,
         "시민은 같은 제시어를 받고, 라이어는 주제만 받습니다.\n"
+        "봇이 정한 발언 순서대로 돌아가며 토론합니다.\n"
+        "토론 중 과반수 버튼 투표로 스킵하거나 시간을 연장할 수 있습니다.\n"
         "토론 후 모두가 라이어라고 생각하는 사람에게 투표합니다.\n"
         "시민을 지목하거나 동률/스킵/무투표가 나오면 라이어가 승리합니다.\n"
         "라이어를 지목하면 라이어가 제시어를 추측합니다. 맞히면 라이어 승리, 틀리면 시민 승리입니다.",
