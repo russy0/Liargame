@@ -43,3 +43,4 @@ DISCORD_TOKEN=your_bot_token_here
 게임 중에는 `/라이어설정`으로 기본 라이어 수, 인원, 타이머, 역할 이름을 바꿀 수 있습니다.
 
 봇 초대 시 `Server Members Intent`와 역할 관리 권한이 필요합니다.
+`발언완료` 메시지 인식을 쓰려면 Discord Developer Portal에서 `Message Content Intent`도 켜야 합니다.

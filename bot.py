@@ -69,6 +69,9 @@ class RunningGame:
     vote_complete_event: asyncio.Event = field(default_factory=asyncio.Event)
     participant_user_ids: set[int] = field(default_factory=set)
     original_slowmode_delay: int | None = None
+    discussion_current_speaker_id: int | None = None
+    discussion_current_speaker_name: str = ""
+    discussion_speech_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = field(default_factory=time.monotonic)
     stats_recorded: bool = False
 
@@ -524,6 +527,19 @@ def game_status_text(running: RunningGame) -> str:
     )
 
 
+def is_speech_done_message(content: str) -> bool:
+    return normalize_answer(content) == "발언완료"
+
+
+def complete_current_speech(running: RunningGame, user_id: int) -> bool:
+    if running.game.phase != Phase.DISCUSSION:
+        return False
+    if running.discussion_current_speaker_id != user_id:
+        return False
+    running.discussion_speech_done_event.set()
+    return True
+
+
 class JoinGameView(discord.ui.View):
     def __init__(
         self,
@@ -804,6 +820,32 @@ class GuessView(discord.ui.View):
         await interaction.response.send_modal(GuessModal(self))
 
 
+class SpeechTurnView(discord.ui.View):
+    def __init__(self, running: RunningGame, speaker: Player) -> None:
+        super().__init__(timeout=config.speech_seconds + config.discussion_extension_seconds * config.max_discussion_extensions + 30)
+        self.running = running
+        self.speaker = speaker
+        self.message: discord.Message | None = None
+
+    @discord.ui.button(label="발언 완료", style=discord.ButtonStyle.primary)
+    async def finish_speech(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if interaction.user.id != self.speaker.user_id:
+            await send_interaction_reply(interaction, "현재 발언자만 사용할 수 있습니다.", private=True)
+            return
+        if not complete_current_speech(self.running, interaction.user.id):
+            await send_interaction_reply(interaction, "이미 발언 차례가 끝났습니다.", private=True)
+            return
+        disable_view_items(self)
+        if self.message:
+            with suppress(discord.DiscordException):
+                await self.message.edit(view=self)
+        await send_interaction_reply(interaction, "발언을 완료했습니다.", color=SUCCESS_EMBED_COLOR, private=True)
+
+
 class DiscussionControlView(discord.ui.View):
     def __init__(self, running: RunningGame) -> None:
         super().__init__(timeout=config.discussion_seconds + config.discussion_extension_seconds * config.max_discussion_extensions + 30)
@@ -814,7 +856,7 @@ class DiscussionControlView(discord.ui.View):
         self.skip_votes: set[int] = set()
         self.extension_votes: set[int] = set()
         self.extensions_used = 0
-        self.speech_done_event = asyncio.Event()
+        self.speech_done_event = running.discussion_speech_done_event
         self.skip_event = asyncio.Event()
         self.extension_event = asyncio.Event()
 
@@ -839,6 +881,8 @@ class DiscussionControlView(discord.ui.View):
     def set_current_speaker(self, player: Player) -> None:
         self.current_speaker_id = player.user_id
         self.current_speaker_name = player.name
+        self.running.discussion_current_speaker_id = player.user_id
+        self.running.discussion_current_speaker_name = player.name
         self.speech_done_event.clear()
 
     async def refresh_message(self) -> None:
@@ -879,10 +923,9 @@ class DiscussionControlView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button[discord.ui.View],
     ) -> None:
-        if interaction.user.id != self.current_speaker_id:
+        if not complete_current_speech(self.running, interaction.user.id):
             await send_interaction_reply(interaction, "현재 발언자만 사용할 수 있습니다.", private=True)
             return
-        self.speech_done_event.set()
         await send_interaction_reply(interaction, "발언을 완료했습니다.", color=SUCCESS_EMBED_COLOR, private=True)
 
     @discord.ui.button(label="토론 스킵", style=discord.ButtonStyle.danger)
@@ -918,7 +961,25 @@ class LiarBot(commands.Bot):
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 bot = LiarBot(command_prefix="!", intents=intents)
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot or not message.guild:
+        return
+    running = games.get(message.guild.id)
+    if (
+        running
+        and message.channel.id == running.channel_id
+        and is_speech_done_message(message.content)
+        and complete_current_speech(running, message.author.id)
+    ):
+        with suppress(discord.DiscordException):
+            await message.add_reaction("✅")
+        return
+    await bot.process_commands(message)
 
 
 @bot.event
@@ -1125,32 +1186,41 @@ async def run_discussion_phase(channel: discord.abc.Messageable, running: Runnin
             turn_seconds = min(config.speech_seconds, remaining)
             control_view.set_current_speaker(player)
             await control_view.refresh_message()
-            await send_embed(
+            turn_view = SpeechTurnView(running, player)
+            turn_message = await send_embed(
                 channel,
                 f"현재 발언자: **{player.name}**\n"
                 f"제한 시간: **{duration_text(turn_seconds)}**\n"
-                "발언을 마치면 `발언 완료` 버튼을 누르세요.",
+                "발언을 마치면 이 메시지의 `발언 완료` 버튼을 누르거나 `발언완료`라고 보내세요.",
                 title="발언 차례",
+                view=turn_view,
             )
+            turn_view.message = turn_message
 
             turn_deadline = time.monotonic() + turn_seconds
-            while time.monotonic() < deadline and time.monotonic() < turn_deadline:
-                remaining_turn = max(1, int(min(deadline, turn_deadline) - time.monotonic()))
-                result = await wait_for_discussion_event(control_view, remaining_turn)
-                if result == "extend":
-                    deadline += config.discussion_extension_seconds
-                    await send_embed(
-                        channel,
-                        f"토론 시간이 **{duration_text(config.discussion_extension_seconds)}** 연장되었습니다.",
-                        title="토론 연장",
-                        color=SUCCESS_EMBED_COLOR,
-                    )
-                    await control_view.refresh_message()
-                    continue
-                if result == "skip":
-                    await send_embed(channel, "과반수 요청으로 토론을 종료하고 투표로 넘어갑니다.", title="토론 스킵")
-                    return
-                break
+            try:
+                while time.monotonic() < deadline and time.monotonic() < turn_deadline:
+                    remaining_turn = max(1, int(min(deadline, turn_deadline) - time.monotonic()))
+                    result = await wait_for_discussion_event(control_view, remaining_turn)
+                    if result == "extend":
+                        deadline += config.discussion_extension_seconds
+                        await send_embed(
+                            channel,
+                            f"토론 시간이 **{duration_text(config.discussion_extension_seconds)}** 연장되었습니다.",
+                            title="토론 연장",
+                            color=SUCCESS_EMBED_COLOR,
+                        )
+                        await control_view.refresh_message()
+                        continue
+                    if result == "skip":
+                        await send_embed(channel, "과반수 요청으로 토론을 종료하고 투표로 넘어갑니다.", title="토론 스킵")
+                        return
+                    break
+            finally:
+                disable_view_items(turn_view)
+                if turn_message:
+                    with suppress(discord.DiscordException):
+                        await turn_message.edit(view=turn_view)
 
             speaker_index += 1
     finally:
@@ -1158,6 +1228,8 @@ async def run_discussion_phase(channel: discord.abc.Messageable, running: Runnin
         if control_message:
             with suppress(discord.DiscordException):
                 await control_message.edit(view=control_view)
+        running.discussion_current_speaker_id = None
+        running.discussion_current_speaker_name = ""
 
     await send_embed(channel, "토론 시간이 끝났습니다. 투표로 넘어갑니다.", title="토론 종료")
 
