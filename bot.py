@@ -1273,6 +1273,30 @@ async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
                 await vote_message.edit(view=vote_view)
 
         vote_result = game.resolve_vote()
+
+        if vote_result.tied and game.winner is None:
+            await send_embed(
+                channel,
+                f"투표가 동률입니다. 1회 재투표를 진행합니다.\n\n투표 집계\n{game.vote_summary_text()}",
+                title="동률 — 재투표",
+                color=WARNING_EMBED_COLOR,
+            )
+            running.vote_complete_event.clear()
+            revote_view = VoteView(running)
+            revote_message = await send_embed(
+                channel, revote_view.status_text(), title="재투표 — 라이어 지목", view=revote_view
+            )
+            revote_view.message = revote_message
+            try:
+                await asyncio.wait_for(running.vote_complete_event.wait(), timeout=config.vote_seconds)
+            except asyncio.TimeoutError:
+                pass
+            disable_view_items(revote_view)
+            if revote_message:
+                with suppress(discord.DiscordException):
+                    await revote_message.edit(view=revote_view)
+            vote_result = game.resolve_vote()
+
         await announce_vote_result(channel, running, vote_result)
 
         if game.phase == Phase.GUESS and vote_result.target:
