@@ -24,6 +24,7 @@ STATS_FILE = BASE_DIR / "liar_stats.json"
 RECRUITMENT_SECONDS_FALLBACK = 60
 MAX_GAME_PLAYERS = 24
 GAME_NOTIFICATION_ROLE = "게임알림"
+CONTINUE_VOTE_SECONDS = 30
 
 DEFAULT_EMBED_COLOR = discord.Color.gold()
 ERROR_EMBED_COLOR = discord.Color.red()
@@ -55,6 +56,7 @@ class BotConfig:
     vote_seconds: int = 45
     guess_seconds: int = 30
     chat_slowmode_seconds: int = 3
+    continue_vote_enabled: bool = True
     word_bank: dict[str, list[str]] = field(default_factory=lambda: dict(DEFAULT_WORD_BANK))
 
 
@@ -74,6 +76,9 @@ class RunningGame:
     discussion_speech_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     started_at: float = field(default_factory=time.monotonic)
     stats_recorded: bool = False
+    liar_count: int = 1
+    round_number: int = 1
+    session_scores: dict[int, int] = field(default_factory=dict)
 
 
 config = BotConfig()
@@ -183,6 +188,28 @@ def add_stat(entry: dict[str, object], key: str, amount: int = 1) -> None:
 
 def player_won_game(player: Player, winner: Winner) -> bool:
     return (player.is_liar and winner == Winner.LIARS) or (not player.is_liar and winner == Winner.CITIZENS)
+
+
+def update_session_scores(running: RunningGame) -> None:
+    game = running.game
+    if not game.winner:
+        return
+    for player in game.players:
+        running.session_scores.setdefault(player.user_id, 0)
+        if player_won_game(player, game.winner):
+            running.session_scores[player.user_id] += 1
+
+
+def session_scores_text(running: RunningGame) -> str:
+    name_map = {p.user_id: p.name for p in running.game.players}
+    rows = sorted(
+        running.session_scores.items(),
+        key=lambda item: (-item[1], name_map.get(item[0], "").casefold()),
+    )
+    return "\n".join(
+        f"{rank}. **{name_map.get(uid, str(uid))}** {score}점"
+        for rank, (uid, score) in enumerate(rows, start=1)
+    )
 
 
 def record_game_stats(running: RunningGame, winner: Winner, vote_result: VoteResult | None) -> None:
@@ -430,6 +457,7 @@ def current_settings_text(prefix: str = "라이어게임 설정") -> str:
         f"발언/연장: `{config.speech_seconds}`/`{config.discussion_extension_seconds}`초, "
         f"최대 `{config.max_discussion_extensions}`회\n"
         f"토론 슬로우모드: `{config.chat_slowmode_seconds}`초\n"
+        f"이어하기 투표: `{'켜짐' if config.continue_vote_enabled else '꺼짐'}`\n"
         f"단어 카테고리: {categories}"
     )
 
@@ -469,7 +497,8 @@ async def remove_participant_roles(guild: discord.Guild, running: RunningGame) -
 async def set_discussion_slowmode(channel: discord.abc.Messageable, running: RunningGame) -> None:
     if not isinstance(channel, discord.TextChannel):
         return
-    running.original_slowmode_delay = channel.slowmode_delay
+    if running.original_slowmode_delay is None:  # 첫 라운드에만 원본 저장
+        running.original_slowmode_delay = channel.slowmode_delay
     if channel.slowmode_delay == config.chat_slowmode_seconds:
         return
     with suppress(discord.DiscordException):
@@ -953,6 +982,77 @@ class DiscussionControlView(discord.ui.View):
             await self.refresh_message()
 
 
+class ContinueView(discord.ui.View):
+    def __init__(self, running: RunningGame) -> None:
+        super().__init__(timeout=CONTINUE_VOTE_SECONDS + 5)
+        self.running = running
+        self.yes_votes: set[int] = set()
+        self.done = asyncio.Event()
+        self.message: discord.Message | None = None
+
+    def required_votes(self) -> int:
+        return len(self.running.participant_user_ids) // 2 + 1
+
+    def status_text(self) -> str:
+        return (
+            f"같은 멤버로 다음 라운드를 진행할까요?\n"
+            f"찬성: **{len(self.yes_votes)}/{self.required_votes()}표** 필요\n"
+            f"**{CONTINUE_VOTE_SECONDS}초** 안에 과반수 찬성 시 이어서 진행합니다."
+        )
+
+    @discord.ui.button(label="이어하기 ✅", style=discord.ButtonStyle.success)
+    async def vote_continue(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[discord.ui.View],
+    ) -> None:
+        if interaction.user.id not in self.running.participant_user_ids:
+            await send_interaction_reply(interaction, "게임 참가자만 투표할 수 있습니다.", private=True)
+            return
+        if interaction.user.id in self.yes_votes:
+            await send_interaction_reply(interaction, "이미 투표했습니다.", private=True)
+            return
+        self.yes_votes.add(interaction.user.id)
+        if len(self.yes_votes) >= self.required_votes():
+            await send_interaction_reply(interaction, "과반수 달성! 다음 라운드를 시작합니다.", color=SUCCESS_EMBED_COLOR, private=True)
+            self.done.set()
+            self.stop()
+        else:
+            remain = self.required_votes() - len(self.yes_votes)
+            await send_interaction_reply(
+                interaction,
+                f"투표 완료. 현재 {len(self.yes_votes)}/{self.required_votes()}표 ({remain}표 더 필요)",
+                private=True,
+            )
+        if self.message:
+            with suppress(discord.DiscordException):
+                await self.message.edit(embed=make_embed(self.status_text(), title="이어하기 투표"), view=self)
+
+
+async def run_continue_vote(channel: discord.abc.Messageable, running: RunningGame) -> bool:
+    view = ContinueView(running)
+    message = await send_embed(channel, view.status_text(), title="이어하기 투표", view=view)
+    view.message = message
+    try:
+        await asyncio.wait_for(view.done.wait(), timeout=CONTINUE_VOTE_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+    disable_view_items(view)
+    reached = len(view.yes_votes) >= view.required_votes()
+    if message:
+        suffix = "\n\n✅ 과반수 달성! 다음 라운드를 시작합니다." if reached else f"\n\n⏰ 시간 초과. ({len(view.yes_votes)}/{view.required_votes()}표) 이어하기가 취소됩니다."
+        with suppress(discord.DiscordException):
+            await message.edit(
+                embed=make_embed(
+                    view.status_text() + suffix,
+                    title="이어하기 투표",
+                    color=SUCCESS_EMBED_COLOR if reached else WARNING_EMBED_COLOR,
+                ),
+                view=view,
+            )
+    return reached
+
+
 class LiarBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.tree.sync()
@@ -1103,6 +1203,7 @@ async def start_game(
             participant_role_id=role.id,
             game=game,
             participant_user_ids=set(join_view.joined_ids),
+            liar_count=liar_count,
         )
         games[interaction.guild.id] = running
         running.task = asyncio.create_task(game_loop(interaction.guild, running))
@@ -1238,73 +1339,95 @@ async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
     if not isinstance(channel, discord.abc.Messageable):
         games.pop(running.guild_id, None)
         return
-    game = running.game
     try:
-        await send_embed(
-            channel,
-            f"참가자 **{len(game.players)}명**, 라이어 **{len(game.liars())}명**으로 시작합니다.\n"
-            "각자 DM으로 받은 비밀 정보를 확인하세요.",
-            title="라이어게임 시작",
-            color=SUCCESS_EMBED_COLOR,
-        )
-        failed_dm = await send_secret_messages(guild, game)
-        if failed_dm:
+        while True:
+            game = running.game
+            round_label = f"라운드 {running.round_number} " if running.round_number > 1 else ""
+            scores_section = (
+                f"\n\n**점수판**\n{session_scores_text(running)}"
+                if running.round_number > 1 and running.session_scores
+                else ""
+            )
             await send_embed(
                 channel,
-                "DM 전송 실패: " + ", ".join(failed_dm) + "\n개인 DM 허용 설정을 확인하세요.",
-                title="비밀 정보 전송 실패",
-                color=WARNING_EMBED_COLOR,
+                f"참가자 **{len(game.players)}명**, 라이어 **{len(game.liars())}명**으로 시작합니다.\n"
+                f"각자 DM으로 받은 비밀 정보를 확인하세요.{scores_section}",
+                title=f"{round_label}라이어게임 시작",
+                color=SUCCESS_EMBED_COLOR,
             )
+            failed_dm = await send_secret_messages(guild, game)
+            if failed_dm:
+                await send_embed(
+                    channel,
+                    "DM 전송 실패: " + ", ".join(failed_dm) + "\n개인 DM 허용 설정을 확인하세요.",
+                    title="비밀 정보 전송 실패",
+                    color=WARNING_EMBED_COLOR,
+                )
 
-        await run_discussion_phase(channel, running)
+            await run_discussion_phase(channel, running)
 
-        game.start_vote()
-        running.vote_complete_event.clear()
-        vote_view = VoteView(running)
-        vote_message = await send_embed(channel, vote_view.status_text(), title="라이어 지목 투표", view=vote_view)
-        vote_view.message = vote_message
-        try:
-            await asyncio.wait_for(running.vote_complete_event.wait(), timeout=config.vote_seconds)
-        except asyncio.TimeoutError:
-            pass
-        disable_view_items(vote_view)
-        if vote_message:
-            with suppress(discord.DiscordException):
-                await vote_message.edit(view=vote_view)
-
-        vote_result = game.resolve_vote()
-
-        if vote_result.tied and game.winner is None:
-            await send_embed(
-                channel,
-                f"투표가 동률입니다. 1회 재투표를 진행합니다.\n\n투표 집계\n{game.vote_summary_text()}",
-                title="동률 — 재투표",
-                color=WARNING_EMBED_COLOR,
-            )
+            game.start_vote()
             running.vote_complete_event.clear()
-            revote_view = VoteView(running)
-            revote_message = await send_embed(
-                channel, revote_view.status_text(), title="재투표 — 라이어 지목", view=revote_view
-            )
-            revote_view.message = revote_message
+            vote_view = VoteView(running)
+            vote_message = await send_embed(channel, vote_view.status_text(), title="라이어 지목 투표", view=vote_view)
+            vote_view.message = vote_message
             try:
                 await asyncio.wait_for(running.vote_complete_event.wait(), timeout=config.vote_seconds)
             except asyncio.TimeoutError:
                 pass
-            disable_view_items(revote_view)
-            if revote_message:
+            disable_view_items(vote_view)
+            if vote_message:
                 with suppress(discord.DiscordException):
-                    await revote_message.edit(view=revote_view)
+                    await vote_message.edit(view=vote_view)
+
             vote_result = game.resolve_vote()
 
-        await announce_vote_result(channel, running, vote_result)
+            if vote_result.tied and game.winner is None:
+                await send_embed(
+                    channel,
+                    f"투표가 동률입니다. 1회 재투표를 진행합니다.\n\n투표 집계\n{game.vote_summary_text()}",
+                    title="동률 — 재투표",
+                    color=WARNING_EMBED_COLOR,
+                )
+                running.vote_complete_event.clear()
+                revote_view = VoteView(running)
+                revote_message = await send_embed(
+                    channel, revote_view.status_text(), title="재투표 — 라이어 지목", view=revote_view
+                )
+                revote_view.message = revote_message
+                try:
+                    await asyncio.wait_for(running.vote_complete_event.wait(), timeout=config.vote_seconds)
+                except asyncio.TimeoutError:
+                    pass
+                disable_view_items(revote_view)
+                if revote_message:
+                    with suppress(discord.DiscordException):
+                        await revote_message.edit(view=revote_view)
+                vote_result = game.resolve_vote()
 
-        if game.phase == Phase.GUESS and vote_result.target:
-            await run_guess_phase(channel, running, vote_result.target)
+            await announce_vote_result(channel, running, vote_result)
 
-        if game.winner:
-            record_game_stats(running, game.winner, vote_result)
-            await announce_final_result(channel, running)
+            if game.phase == Phase.GUESS and vote_result.target:
+                await run_guess_phase(channel, running, vote_result.target)
+
+            if game.winner:
+                record_game_stats(running, game.winner, vote_result)
+                update_session_scores(running)
+                await announce_final_result(channel, running)
+
+            if not game.winner or not config.continue_vote_enabled or not await run_continue_vote(channel, running):
+                break
+
+            # 다음 라운드 준비
+            running.round_number += 1
+            running.stats_recorded = False
+            running.vote_complete_event = asyncio.Event()
+            running.discussion_speech_done_event = asyncio.Event()
+            running.started_at = time.monotonic()
+            players = [(p.user_id, p.name) for p in game.players]
+            word, category = choose_word(None, None)
+            running.game = LiarGame(players, word, category, running.liar_count)
+
     except asyncio.CancelledError:
         await send_embed(channel, "게임이 중지되었습니다.", title="라이어게임 중지", color=ERROR_EMBED_COLOR)
     except Exception as error:
@@ -1434,10 +1557,16 @@ async def run_guess_phase(channel: discord.abc.Messageable, running: RunningGame
 async def announce_final_result(channel: discord.abc.Messageable, running: RunningGame) -> None:
     game = running.game
     winner_text = "라이어" if game.winner == Winner.LIARS else "시민"
+    scores_section = (
+        f"\n\n**점수판**\n{session_scores_text(running)}"
+        if running.session_scores
+        else ""
+    )
+    title = f"라운드 {running.round_number} 종료" if running.round_number > 1 else "게임 종료"
     await send_embed(
         channel,
-        f"승리 팀: **{winner_text}**\n\n{game.reveal_text()}",
-        title="게임 종료",
+        f"승리 팀: **{winner_text}**\n\n{game.reveal_text()}{scores_section}",
+        title=title,
         color=SUCCESS_EMBED_COLOR,
     )
 
@@ -1527,6 +1656,7 @@ async def show_categories(interaction: discord.Interaction, 검색어: str | Non
     슬로우모드초="토론 채널 슬로우모드",
     참가역할="참가자에게 부여할 역할 이름",
     관리자역할="관리 명령을 사용할 역할 이름",
+    이어하기="게임 종료 후 이어하기 투표 활성화 여부",
 )
 async def configure_game(
     interaction: discord.Interaction,
@@ -1543,6 +1673,7 @@ async def configure_game(
     슬로우모드초: int | None = None,
     참가역할: str | None = None,
     관리자역할: str | None = None,
+    이어하기: bool | None = None,
 ) -> None:
     if not await require_manager_reply(interaction):
         return
@@ -1572,6 +1703,8 @@ async def configure_game(
         config.participant_role = 참가역할.strip()
     if 관리자역할:
         config.manager_role = 관리자역할.strip()
+    if 이어하기 is not None:
+        config.continue_vote_enabled = 이어하기
     save_config()
     await send_interaction_reply(
         interaction,
