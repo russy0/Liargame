@@ -75,6 +75,7 @@ class LiarGame:
         self.accused_liar_id: int | None = None
         self.last_vote_result: VoteResult | None = None
         self.last_guess_result: GuessResult | None = None
+        self.revote_used: bool = False
 
     @staticmethod
     def _validate(players: list[tuple[int, str]], word: str, liar_count: int) -> None:
@@ -122,8 +123,12 @@ class LiarGame:
         top_targets = [target_id for target_id, count in counts.items() if count == top_count]
         if len(top_targets) != 1:
             result = VoteResult(target=None, tied=True, no_votes=False, vote_counts=dict(counts))
-            self._finish(Winner.LIARS)
             self.last_vote_result = result
+            if not self.revote_used:
+                self.revote_used = True
+                self.votes.clear()
+                return result
+            self._finish(Winner.LIARS)
             return result
 
         target_id = top_targets[0]
