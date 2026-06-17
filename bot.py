@@ -79,6 +79,7 @@ class RunningGame:
     liar_count: int = 1
     round_number: int = 1
     session_scores: dict[int, int] = field(default_factory=dict)
+    original_channel_overwrites: dict | None = None
 
 
 config = BotConfig()
@@ -503,6 +504,31 @@ async def set_discussion_slowmode(channel: discord.abc.Messageable, running: Run
         return
     with suppress(discord.DiscordException):
         await channel.edit(slowmode_delay=config.chat_slowmode_seconds, reason="라이어게임 토론 슬로우모드 적용")
+
+
+async def lock_channel_for_game(channel: discord.abc.Messageable, running: RunningGame) -> None:
+    if not isinstance(channel, discord.TextChannel):
+        return
+    default_role = channel.guild.default_role
+    participant_role = channel.guild.get_role(running.participant_role_id)
+    existing = dict(channel.overwrites)
+    running.original_channel_overwrites = {
+        default_role: existing.get(default_role),
+        **({participant_role: existing.get(participant_role)} if participant_role else {}),
+    }
+    with suppress(discord.DiscordException):
+        await channel.set_permissions(default_role, send_messages=False)
+    if participant_role:
+        with suppress(discord.DiscordException):
+            await channel.set_permissions(participant_role, send_messages=True)
+
+
+async def unlock_channel_after_game(channel: discord.abc.Messageable, running: RunningGame) -> None:
+    if not isinstance(channel, discord.TextChannel) or running.original_channel_overwrites is None:
+        return
+    for target, overwrite in running.original_channel_overwrites.items():
+        with suppress(discord.DiscordException):
+            await channel.set_permissions(target, overwrite=overwrite)
 
 
 async def restore_slowmode(channel: discord.abc.Messageable, running: RunningGame) -> None:
@@ -1339,6 +1365,7 @@ async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
     if not isinstance(channel, discord.abc.Messageable):
         games.pop(running.guild_id, None)
         return
+    await lock_channel_for_game(channel, running)
     try:
         while True:
             game = running.game
@@ -1440,6 +1467,7 @@ async def game_loop(guild: discord.Guild, running: RunningGame) -> None:
         )
     finally:
         await restore_slowmode(channel, running)
+        await unlock_channel_after_game(channel, running)
         await remove_participant_roles(guild, running)
         if games.get(running.guild_id) is running:
             games.pop(running.guild_id, None)
